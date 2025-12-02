@@ -18,6 +18,47 @@ except ImportError:
     USE_OPEN3D = False
     print("Warning: open3d未安装，将使用手动方法生成点云")
 
+# 检查pycocotools是否安装（用于解码COCO格式的RLE mask）
+try:
+    import pycocotools.mask as mask_util
+    USE_PYCOCOTOOLS = True
+except ImportError:
+    USE_PYCOCOTOOLS = False
+    print("Warning: pycocotools未安装，无法解码COCO格式的RLE mask")
+    print("  这将导致语义标注无法正确应用到点云中")
+    print("  请安装: pip install pycocotools")
+
+def clean_json_data(obj):
+    """
+    清理JSON数据，将bytes对象转换为字符串，以便JSON序列化
+    
+    Args:
+        obj: 要清理的对象（可以是dict, list, 或其他类型）
+    
+    Returns:
+        清理后的对象
+    """
+    if isinstance(obj, dict):
+        return {key: clean_json_data(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_json_data(item) for item in obj]
+    elif isinstance(obj, bytes):
+        # 将bytes转换为字符串（假设是UTF-8编码）
+        try:
+            return obj.decode('utf-8')
+        except UnicodeDecodeError:
+            # 如果无法解码为UTF-8，使用base64编码
+            import base64
+            return base64.b64encode(obj).decode('ascii')
+    elif isinstance(obj, (np.integer, np.floating)):
+        # 将numpy数值类型转换为Python原生类型
+        return obj.item()
+    elif isinstance(obj, np.ndarray):
+        # 将numpy数组转换为列表
+        return obj.tolist()
+    else:
+        return obj
+
 def load_depth_image(depth_path, depth_scale=1000.0):
     """
     加载深度图，返回深度值（单位：米）
@@ -48,18 +89,24 @@ def decode_rle_to_mask(rle, height, width):
         width: mask的宽度
     
     Returns:
-        mask: 二值mask (bool数组)
+        mask: 二值mask (bool数组)，如果解码失败返回None
     """
-    import pycocotools.mask as mask_util
+    if not USE_PYCOCOTOOLS:
+        return None
     
-    # 确保counts是bytes格式
-    if isinstance(rle['counts'], str):
-        rle['counts'] = rle['counts'].encode('utf-8')
-    
-    # 解码RLE
-    mask = mask_util.decode(rle)
-    
-    return mask.astype(bool)
+    try:
+        # 创建rle的副本，避免修改原始数据
+        rle_copy = rle.copy()
+        # 确保counts是bytes格式（不修改原始数据）
+        if isinstance(rle_copy['counts'], str):
+            rle_copy['counts'] = rle_copy['counts'].encode('utf-8')
+        
+        # 解码RLE
+        mask = mask_util.decode(rle_copy)
+        
+        return mask.astype(bool)
+    except Exception as e:
+        return None
 
 def create_semantic_mask_from_annotations(annotations, image_id, height, width, categories):
     """
@@ -99,9 +146,18 @@ def create_semantic_mask_from_annotations(annotations, image_id, height, width, 
             if isinstance(segmentation, dict):
                 # RLE格式
                 mask = decode_rle_to_mask(segmentation, height, width)
+                if mask is None:
+                    # 解码失败，可能是pycocotools未安装
+                    if not USE_PYCOCOTOOLS:
+                        print(f"Warning: Failed to decode annotation {ann.get('id')}: pycocotools未安装，无法解码RLE mask")
+                    else:
+                        print(f"Warning: Failed to decode annotation {ann.get('id')}: RLE解码失败")
+                    continue
             elif isinstance(segmentation, list):
                 # 多边形格式（如果有）
-                import pycocotools.mask as mask_util
+                if not USE_PYCOCOTOOLS:
+                    print(f"Warning: Failed to decode annotation {ann.get('id')}: pycocotools未安装，无法解码多边形格式")
+                    continue
                 rle = mask_util.frPyObjects(segmentation, height, width)
                 mask = mask_util.decode(rle)
                 mask = mask.astype(bool)
@@ -266,8 +322,7 @@ def generate_pointcloud_open3d(rgb_path, depth_path, annotations, image_id,
     if len(points_camera) == 0:
         return None, None, None
     
-    # 从annotations创建语义mask（需要与点云对应）
-    # 由于Open3D可能过滤了一些点，我们需要将mask映射到点云
+    # 从annotations创建语义mask（基于原始图像尺寸）
     semantic_mask = create_semantic_mask_from_annotations(
         annotations, image_id, original_height, original_width, categories
     )
@@ -279,11 +334,29 @@ def generate_pointcloud_open3d(rgb_path, depth_path, annotations, image_id,
             (width, height), 
             interpolation=cv2.INTER_NEAREST
         ).astype(np.uint8)
+        mask_width, mask_height = width, height
+    else:
+        # 如果downsample_factor=1.0，检查内参是否被缩放
+        # 如果内参被缩放了0.5，投影坐标的范围会相应调整
+        # 我们需要将mask缩放到与投影坐标匹配的尺寸
+        # 由于内参fx被缩放了0.5，投影坐标u的范围会缩小，需要相应缩放mask
+        # 但更简单的方法是：保持mask为原始尺寸，然后调整投影坐标
+        mask_width, mask_height = original_width, original_height
     
     # 将点云坐标投影回像素坐标，以获取对应的语义标签
+    # 注意：Open3D使用的内参是缩放后的（fx, fy, cx, cy），投影坐标基于当前图像尺寸
+    # 如果mask是原始尺寸，需要将投影坐标映射到原始尺寸
     semantics = []
+    projection_errors = 0
+    out_of_bounds = 0
+    robot_arm_points_found = 0
+    
+    # 计算坐标缩放因子（如果mask尺寸与投影尺寸不同）
+    coord_scale_x = mask_width / width if width > 0 and mask_width != width else 1.0
+    coord_scale_y = mask_height / height if height > 0 and mask_height != height else 1.0
+    
     for i, point in enumerate(points_camera):
-        # 投影到像素坐标
+        # 投影到像素坐标（使用Open3D实际使用的内参）
         z = point[2]
         if z <= 0:
             semantics.append(2)  # others
@@ -292,11 +365,28 @@ def generate_pointcloud_open3d(rgb_path, depth_path, annotations, image_id,
         u = int(fx * point[0] / z + cx)
         v = int(fy * point[1] / z + cy)
         
+        # 如果mask尺寸与投影尺寸不同，需要缩放坐标
+        if coord_scale_x != 1.0 or coord_scale_y != 1.0:
+            u = int(u * coord_scale_x)
+            v = int(v * coord_scale_y)
+        
         # 检查边界
-        if 0 <= u < width and 0 <= v < height:
-            semantics.append(semantic_mask[v, u])
+        if 0 <= u < mask_width and 0 <= v < mask_height:
+            try:
+                semantic_label = semantic_mask[v, u]
+                semantics.append(semantic_label)
+                if semantic_label == 1:
+                    robot_arm_points_found += 1
+            except IndexError:
+                # 如果索引越界，说明mask尺寸不匹配
+                projection_errors += 1
+                semantics.append(2)  # others
         else:
+            out_of_bounds += 1
             semantics.append(2)  # others
+    
+    semantics = np.array(semantics)
+    colors = colors_o3d.astype(np.uint8)
     
     semantics = np.array(semantics)
     colors = colors_o3d.astype(np.uint8)
@@ -516,7 +606,39 @@ def process_dataset(meta_json_path, dataset_dir, num_samples=None, visualize=Tru
             # 验证语义信息
             actual_robot_arm = np.sum(semantics == 1)
             if robot_arm_count > 0 and actual_robot_arm == 0:
-                print(f"Warning: 图像 {image_id} 有 {robot_arm_count} 个robot arm annotations，但点云中为0")
+                # 诊断问题原因
+                diagnostic_msg = f"Warning: 图像 {image_id} 有 {robot_arm_count} 个robot arm annotations，但点云中为0"
+                if not USE_PYCOCOTOOLS:
+                    diagnostic_msg += " (可能原因: pycocotools未安装，annotation无法解码)"
+                else:
+                    # 检查深度图在robot arm区域是否有有效深度
+                    try:
+                        semantic_mask = create_semantic_mask_from_annotations(
+                            all_annotations, image_id, 
+                            img_info.get('height', 360), 
+                            img_info.get('width', 640), 
+                            categories
+                        )
+                        robot_arm_pixels = np.sum(semantic_mask == 1)
+                        if robot_arm_pixels > 0:
+                            # 检查深度图
+                            depth_array = load_depth_image(depth_path, depth_scale=1000.0)
+                            robot_arm_depth = depth_array[semantic_mask == 1]
+                            valid_depth_count = np.sum((robot_arm_depth > 0.3) & (robot_arm_depth < 1.0))
+                            if valid_depth_count == 0:
+                                diagnostic_msg += f" (可能原因: robot arm区域({robot_arm_pixels}像素)的深度值无效或超出范围[0.3m, 1.0m])"
+                            else:
+                                # 深度有效，但点云中没有robot arm点，可能的原因：
+                                # 1. Open3D在创建点云时过滤了这些点（NaN/Inf/其他过滤逻辑）
+                                # 2. 投影坐标计算错误，导致无法正确映射到semantic_mask
+                                # 3. 内参缩放导致坐标不匹配
+                                diagnostic_msg += f" (可能原因: 深度有效({valid_depth_count}/{robot_arm_pixels}像素)但点云中无robot arm点。"
+                                diagnostic_msg += " 可能原因：1) Open3D过滤了这些点 2) 投影坐标计算错误 3) 内参缩放导致坐标不匹配)"
+                        else:
+                            diagnostic_msg += " (可能原因: annotation解码失败，语义mask中无robot arm区域)"
+                    except Exception as e:
+                        diagnostic_msg += f" (诊断失败: {e})"
+                print(diagnostic_msg)
             
             # 保存点云
             pointcloud_filename = rgb_filename.replace(".jpg", ".ply").replace(".jpeg", ".ply")
@@ -538,8 +660,10 @@ def process_dataset(meta_json_path, dataset_dir, num_samples=None, visualize=Tru
     
     # 保存更新后的meta_info.json
     print(f"\n正在更新 {meta_json_path}...")
+    # 清理数据中的bytes对象，确保可以JSON序列化
+    coco_data_clean = clean_json_data(coco_data)
     with open(meta_json_path, 'w', encoding='utf-8') as f:
-        json.dump(coco_data, f, indent=2, ensure_ascii=False)
+        json.dump(coco_data_clean, f, indent=2, ensure_ascii=False)
     
     print(f"\n处理完成！")
     print(f"成功处理: {processed_count} 个样本")

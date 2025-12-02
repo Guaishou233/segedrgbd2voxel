@@ -377,13 +377,14 @@ def process_dataset(meta_json_path, rgb_dir, model_path, dataset_dir, device="cu
             image_size = (img_info["width"], img_info["height"])
             seg_mask = create_segmentation_mask(masks, boxes, scores, image_size)
             
-            # 保存分割mask（为了更好的可视化，将值映射：1->255(白色), 2->0(黑色)）
+            # 保存分割mask（为了更好的可视化，将值映射：1->255(白色), 2->128(中灰色)）
             seg_filename = rgb_filename.replace(".jpg", ".png").replace(".jpeg", ".png")
             seg_path = os.path.join(seg_output_dir, seg_filename)
-            # 将类别值映射到可视化范围：robot arm(1) -> 255(白色), others(2) -> 0(黑色)
+            # 将类别值映射到可视化范围：robot arm(1) -> 255(白色), others(2) -> 128(中灰色)
+            # 使用更大的颜色区分度，避免图像看起来全黑
             vis_mask = np.zeros_like(seg_mask, dtype=np.uint8)
             vis_mask[seg_mask == 1] = 255  # robot arm显示为白色
-            vis_mask[seg_mask == 2] = 0     # others显示为黑色
+            vis_mask[seg_mask == 2] = 128  # others显示为中灰色（增加区分度）
             seg_image = Image.fromarray(vis_mask, mode='L')
             seg_image.save(seg_path)
             
