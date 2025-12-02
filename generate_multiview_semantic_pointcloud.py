@@ -770,6 +770,130 @@ def load_pointcloud_with_semantics(ply_path):
     
     return np.array(points), np.array(colors), np.array(semantics)
 
+def create_camera_frustum_visualization(intrinsic, extrinsic, image_width, image_height, scale=0.1):
+    """
+    创建立体锥形的相机视锥可视化（用于Open3D可视化）
+    使用Open3D的create_camera_visualization方法创建相机视锥
+    
+    Args:
+        intrinsic: 相机内参矩阵 3x3
+        extrinsic: 相机外参矩阵 4x4
+        image_width: 图像宽度（像素）
+        image_height: 图像高度（像素）
+        scale: 视锥的缩放因子（米）
+    
+    Returns:
+        camera_frustum: Open3D LineSet对象，表示相机视锥
+    """
+    try:
+        # 使用Open3D的内置方法创建相机视锥
+        # 确保内参是3x3矩阵
+        intrinsic_array = np.array(intrinsic)
+        if intrinsic_array.shape == (3, 3):
+            intrinsic_3x3 = intrinsic_array
+        elif intrinsic_array.shape == (4, 4):
+            intrinsic_3x3 = intrinsic_array[:3, :3]
+        else:
+            # 尝试重塑为3x3
+            intrinsic_3x3 = intrinsic_array.reshape(3, 3) if intrinsic_array.size == 9 else intrinsic_array[:3, :3]
+        
+        # 确保外参是4x4矩阵
+        extrinsic_array = np.array(extrinsic)
+        if extrinsic_array.shape == (4, 4):
+            extrinsic_4x4 = extrinsic_array
+        else:
+            # 如果不是4x4，尝试构建
+            extrinsic_4x4 = np.eye(4)
+            if extrinsic_array.shape == (3, 3):
+                extrinsic_4x4[:3, :3] = extrinsic_array
+            elif extrinsic_array.shape == (3, 4):
+                extrinsic_4x4[:3, :] = extrinsic_array
+        
+        # 创建相机视锥
+        camera_frustum = o3d.geometry.LineSet.create_camera_visualization(
+            view_width_px=image_width,
+            view_height_px=image_height,
+            intrinsic=intrinsic_3x3,
+            extrinsic=extrinsic_4x4,
+            scale=scale
+        )
+        
+        # 设置颜色（使用半透明的蓝色，便于观察）
+        camera_frustum.paint_uniform_color([0.2, 0.6, 1.0])  # 浅蓝色
+        
+        return camera_frustum
+    
+    except Exception as e:
+        print(f"  Warning: 无法使用Open3D的create_camera_visualization: {e}")
+        # 回退到手动创建简单的视锥
+        return create_camera_frustum_manual(extrinsic, scale)
+
+def create_camera_frustum_manual(extrinsic, scale=0.1):
+    """
+    手动创建相机视锥（回退方案）
+    
+    Args:
+        extrinsic: 相机外参矩阵 4x4
+        scale: 视锥的大小（米）
+    
+    Returns:
+        camera_frustum: Open3D LineSet对象，表示相机视锥
+    """
+    R = np.array(extrinsic[:3, :3])
+    t = np.array(extrinsic[:3, 3])
+    
+    # 相机位置（视锥的顶点）
+    camera_pos = t
+    
+    # 相机坐标系的方向向量（在世界坐标系中）
+    # OpenCV约定：Z轴向前（指向场景），X轴向右，Y轴向下
+    x_axis = R[:, 0]  # 相机右方向
+    y_axis = R[:, 1]  # 相机下方向
+    z_axis = -R[:, 2]  # 相机前方向（指向场景）
+    
+    # 创建视锥的四个角点（在距离scale的平面上）
+    # 假设视场角约为60度，创建一个矩形视锥
+    frustum_width = scale * 0.5
+    frustum_height = scale * 0.375  # 16:9 宽高比
+    
+    # 视锥的四个角点（在相机前方）
+    corner1 = camera_pos + z_axis * scale + x_axis * frustum_width + y_axis * frustum_height
+    corner2 = camera_pos + z_axis * scale - x_axis * frustum_width + y_axis * frustum_height
+    corner3 = camera_pos + z_axis * scale - x_axis * frustum_width - y_axis * frustum_height
+    corner4 = camera_pos + z_axis * scale + x_axis * frustum_width - y_axis * frustum_height
+    
+    # 创建点（相机位置 + 四个角点）
+    points = np.array([
+        camera_pos,  # 0: 相机位置（顶点）
+        corner1,     # 1: 右上角
+        corner2,     # 2: 左上角
+        corner3,     # 3: 左下角
+        corner4,     # 4: 右下角
+    ])
+    
+    # 创建连接线（从相机位置到四个角点，以及四个角点之间的连接）
+    lines = np.array([
+        [0, 1],  # 相机 -> 右上角
+        [0, 2],  # 相机 -> 左上角
+        [0, 3],  # 相机 -> 左下角
+        [0, 4],  # 相机 -> 右下角
+        [1, 2],  # 右上角 -> 左上角
+        [2, 3],  # 左上角 -> 左下角
+        [3, 4],  # 左下角 -> 右下角
+        [4, 1],  # 右下角 -> 右上角
+    ])
+    
+    # 创建颜色（浅蓝色）
+    colors = np.array([[0.2, 0.6, 1.0]] * len(lines))
+    
+    # 创建LineSet
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    
+    return line_set
+
 def visualize_pointclouds_interactive(scene_dir, num_samples=10):
     """
     交互式可视化点云数据（使用Open3D）
@@ -787,6 +911,14 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
     if not os.path.exists(pointcloud_dir):
         print(f"Error: 点云目录不存在: {pointcloud_dir}")
         return
+    
+    # 加载相机数据（用于显示相机视锥）
+    print("\n正在加载相机数据...")
+    cameras_data = load_camera_annotations(scene_dir)
+    
+    if len(cameras_data) == 0:
+        print("Warning: 没有找到相机数据，将不显示相机视锥")
+        cameras_data = {}
     
     # 获取点云文件列表
     ply_files = sorted([f for f in os.listdir(pointcloud_dir) if f.endswith('.ply')])
@@ -811,6 +943,7 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
     print("可视化说明：")
     print("  - 红色点 = robot arm (类别1)")
     print("  - 灰色点 = others (类别2)")
+    print("  - 浅蓝色视锥 = 相机位置和朝向")
     print("=" * 60)
     
     # 为每个点云创建交互式可视化
@@ -869,6 +1002,47 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
             show_semantic = True
             vis.add_geometry(current_pcd)
             
+            # 添加相机视锥
+            camera_frustums = []
+            if len(cameras_data) > 0:
+                # 计算合适的视锥大小（基于点云范围）
+                if len(points) > 0:
+                    points_range = np.max(points, axis=0) - np.min(points, axis=0)
+                    max_range = np.max(points_range)
+                    frustum_scale = max_range * 0.15  # 视锥大小为点云范围的15%
+                else:
+                    frustum_scale = 0.1  # 默认值
+                
+                for cam_serial, cam_data in cameras_data.items():
+                    try:
+                        intrinsic = cam_data.get('intrinsic')
+                        extrinsic = cam_data.get('extrinsic')
+                        
+                        if intrinsic is None or extrinsic is None:
+                            continue
+                        
+                        # 获取图像尺寸（从第一个图像获取）
+                        image_width = 640
+                        image_height = 360
+                        if len(cam_data.get('images', [])) > 0:
+                            first_img = cam_data['images'][0]
+                            image_width = first_img.get('width', 640)
+                            image_height = first_img.get('height', 360)
+                        
+                        # 创建相机视锥
+                        camera_frustum = create_camera_frustum_visualization(
+                            intrinsic, extrinsic, image_width, image_height, scale=frustum_scale
+                        )
+                        vis.add_geometry(camera_frustum, reset_bounding_box=False)
+                        camera_frustums.append(camera_frustum)
+                        
+                    except Exception as e:
+                        print(f"  Warning: 无法创建相机 {cam_serial} 的视锥: {e}")
+                        continue
+                
+                if len(camera_frustums) > 0:
+                    print(f"  已添加 {len(camera_frustums)} 个相机视锥（浅蓝色，scale={frustum_scale:.3f}m）")
+            
             # 设置渲染选项
             render_option = vis.get_render_option()
             render_option.point_size = 1.0
@@ -908,6 +1082,8 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
                 print("  按 'S' 切换显示模式（RGB/语义）")
                 print("  按 'R' 重置视角")
             print("  鼠标左键拖拽：旋转 | 右键拖拽：平移 | 滚轮：缩放")
+            if len(camera_frustums) > 0:
+                print(f"  相机视锥：浅蓝色椎体显示 {len(camera_frustums)} 个相机的位置和朝向")
             
             # 在主循环中处理键盘事件
             import time
@@ -927,6 +1103,9 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
                         show_semantic = True
                         print("  切换到语义颜色模式（红色=robot arm, 灰色=others）")
                     vis.add_geometry(current_pcd, reset_bounding_box=False)
+                    # 确保相机视锥仍然可见
+                    for frustum in camera_frustums:
+                        vis.update_geometry(frustum)
                 
                 if keyboard_actions['reset_view']:
                     keyboard_actions['reset_view'] = False
