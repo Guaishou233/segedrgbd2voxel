@@ -187,7 +187,7 @@ def rgbd_to_pointcloud_with_semantics(
     # 读取RGB和深度图
     color = cv2.cvtColor(cv2.imread(color_image_path), cv2.COLOR_BGR2RGB)
     depth = cv2.imread(depth_image_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
-    
+    segmentation = cv2.cvtColor(cv2.imread(segmentation_path), cv2.COLOR_BGR2RGB)
     original_height, original_width = depth.shape
     
     # 下采样图像（如果需要）
@@ -196,6 +196,7 @@ def rgbd_to_pointcloud_with_semantics(
         new_height = int(height / downsample_factor)
         color = cv2.resize(color, (new_width, new_height))
         depth = cv2.resize(depth, (new_width, new_height))
+        segmentation = cv2.resize(segmentation, (new_width, new_height))
         height, width = new_height, new_width
     
     # 深度值转换：从毫米到米
@@ -208,8 +209,15 @@ def rgbd_to_pointcloud_with_semantics(
     # 创建Open3D的RGBDImage
     color_o3d = o3d.geometry.Image(color.astype(np.uint8))
     depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
+    segmentation_o3d = o3d.geometry.Image(segmentation.astype(np.uint8))
     rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
         color_o3d, depth_o3d,
+        depth_scale=1.0,
+        convert_rgb_to_intensity=False
+    )
+
+    segd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
+        segmentation_o3d, depth_o3d,
         depth_scale=1.0,
         convert_rgb_to_intensity=False
     )
@@ -228,83 +236,12 @@ def rgbd_to_pointcloud_with_semantics(
         rgbd_image, intrinsic_o3d, extrinsic=extrinsic
     )
     
-    # 提取点云数据（已经在世界坐标系中）
-    points_world = np.asarray(pcd.points)
-    colors_o3d = np.asarray(pcd.colors) * 255.0  # Open3D颜色范围是0-1，转换为0-255
+    seg_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
+        segd_image, intrinsic_o3d, extrinsic=extrinsic
+    )
     
-    if len(points_world) == 0:
-        return None, None
     
-    # 获取语义mask
-    semantic_mask = None
-    
-    # 优先使用分割图像
-    if segmentation_path and os.path.exists(segmentation_path):
-        semantic_mask = load_segmentation_mask(segmentation_path)
-        if semantic_mask is not None and downsample_factor != 1.0:
-            semantic_mask = cv2.resize(
-                semantic_mask.astype(np.uint8),
-                (width, height),
-                interpolation=cv2.INTER_NEAREST
-            ).astype(np.uint8)
-    
-    # 如果没有分割图像，尝试从annotations创建
-    if semantic_mask is None and annotations is not None and image_id is not None:
-        semantic_mask = create_semantic_mask_from_annotations(
-            annotations, image_id, original_height, original_width
-        )
-        if downsample_factor != 1.0:
-            semantic_mask = cv2.resize(
-                semantic_mask.astype(np.uint8),
-                (width, height),
-                interpolation=cv2.INTER_NEAREST
-            ).astype(np.uint8)
-    
-    # 如果仍然没有语义mask，默认为others（类别2）
-    if semantic_mask is None:
-        semantic_mask = np.ones((height, width), dtype=np.uint8) * 2
-    
-    # 将点云坐标投影回像素坐标，以获取对应的语义标签
-    semantics = []
-    coord_scale_x = original_width / width if width > 0 and original_width != width else 1.0
-    coord_scale_y = original_height / height if height > 0 and original_height != height else 1.0
-    
-    for i, point in enumerate(points_world):
-        # 需要将世界坐标转换回相机坐标进行投影
-        # 计算逆变换：P_camera = R^T * (P_world - t)
-        R = extrinsic[:3, :3]
-        t = extrinsic[:3, 3]
-        point_cam = R.T @ (point - t)
-        
-        z = point_cam[2]
-        if z <= 0:
-            semantics.append(2)  # others
-            continue
-        
-        u = int(fx * point_cam[0] / z + cx)
-        v = int(fy * point_cam[1] / z + cy)
-        
-        # 如果mask尺寸与投影尺寸不同，需要缩放坐标
-        if coord_scale_x != 1.0 or coord_scale_y != 1.0:
-            u = int(u * coord_scale_x)
-            v = int(v * coord_scale_y)
-        
-        # 检查边界
-        if 0 <= u < semantic_mask.shape[1] and 0 <= v < semantic_mask.shape[0]:
-            try:
-                semantic_label = semantic_mask[v, u]
-                semantics.append(semantic_label)
-            except IndexError:
-                semantics.append(2)  # others
-        else:
-            semantics.append(2)  # others
-    
-    semantics = np.array(semantics)
-    
-    # 更新点云颜色（可选：根据语义标签着色）
-    # 这里保持原始RGB颜色，语义信息单独存储
-    
-    return pcd, semantics
+    return pcd, seg_pcd
 
 def merge_pointclouds_with_semantics(pcds_list, semantics_list, 
                                      downsample_voxel_size_m=0.0001,
@@ -339,6 +276,7 @@ def merge_pointclouds_with_semantics(pcds_list, semantics_list,
             continue
         points = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors) * 255.0  # Open3D颜色范围是0-1
+        semantics = np.asarray(semantics.colors) * 255.0
         
         # 确保语义标签长度与点数匹配
         if len(semantics) != len(points):
@@ -354,54 +292,14 @@ def merge_pointclouds_with_semantics(pcds_list, semantics_list,
     
     merged_points = np.vstack(merged_points)
     merged_colors = np.vstack(merged_colors)
-    merged_semantics = np.hstack(merged_semantics)
+    merged_semantics = np.vstack(merged_semantics)
     
     # 创建Open3D点云
     merged_pcd = o3d.geometry.PointCloud()
     merged_pcd.points = o3d.utility.Vector3dVector(merged_points)
     merged_pcd.colors = o3d.utility.Vector3dVector(merged_colors / 255.0)
+    merged_semantics = o3d.utility.Vector3dVector(merged_semantics / 255.0)
     
-    # 体素下采样（使用KDTree最近邻来更新语义标签）
-    if downsample_voxel_size_m > 0:
-        # 保存原始点云和语义标签
-        original_points = merged_points.copy()
-        original_semantics = merged_semantics.copy()
-        
-        # 下采样点云
-        merged_pcd = merged_pcd.voxel_down_sample(downsample_voxel_size_m)
-        downsampled_points = np.asarray(merged_pcd.points)
-        
-        # 使用KDTree找到最近邻来更新语义标签
-        try:
-            from scipy.spatial import cKDTree
-            tree = cKDTree(original_points)
-            _, indices = tree.query(downsampled_points, k=1)
-            merged_semantics = original_semantics[indices]
-        except ImportError:
-            # 如果scipy不可用，使用简单方法：取第一个点的语义标签
-            # 这会导致语义信息不准确，但至少不会报错
-            print("Warning: scipy未安装，体素下采样后的语义标签可能不准确")
-            merged_semantics = np.ones(len(downsampled_points), dtype=np.uint8) * 2
-    
-    # 统计离群点过滤
-    if filter_num_neighbor > 0 and filter_std_ratio > 0:
-        _, ind = merged_pcd.remove_statistical_outlier(
-            nb_neighbors=filter_num_neighbor,
-            std_ratio=filter_std_ratio
-        )
-        merged_pcd = merged_pcd.select_by_index(ind)
-        # 更新语义标签
-        merged_semantics = merged_semantics[ind]
-    
-    # 半径离群点过滤
-    if filter_radius_m > 0 and filter_num_neighbor > 0:
-        _, ind = merged_pcd.remove_radius_outlier(
-            nb_points=filter_num_neighbor,
-            radius=filter_radius_m
-        )
-        merged_pcd = merged_pcd.select_by_index(ind)
-        # 更新语义标签
-        merged_semantics = merged_semantics[ind]
     
     return merged_pcd, merged_semantics
 
@@ -445,8 +343,7 @@ end_header
                                int(colors[i][1]),
                                int(colors[i][2])))
             # 语义标签
-            semantic_label = int(semantics[i]) if i < len(semantics) else 2
-            f.write(struct.pack('<B', semantic_label))
+            f.write(struct.pack('<BBB', int(semantics[i][0]),int(semantics[i][1]),int(semantics[i][2])))
     
     return True
 
@@ -806,11 +703,11 @@ def load_pointcloud_with_semantics(ply_path):
             # r, g, b (uchar)
             r, g, b = struct.unpack('<BBB', f.read(3))
             # semantic (uchar)
-            semantic = struct.unpack('<B', f.read(1))[0]
+            semantic_r, semantic_g, semantic_b = struct.unpack('<BBB', f.read(3))
             
             points.append([x, y, z])
             colors.append([r, g, b])
-            semantics.append(semantic)
+            semantics.append([semantic_r, semantic_g, semantic_b])
     
     return np.array(points), np.array(colors), np.array(semantics)
 
@@ -1026,15 +923,10 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
             pcd_rgb.colors = o3d.utility.Vector3dVector(colors / 255.0)  # Open3D颜色范围是0-1
             
             # 创建语义点云（红色=robot arm, 灰色=others）
-            semantic_colors = np.zeros((len(semantics), 3))
-            robot_arm_mask = semantics == 1
-            others_mask = semantics == 2
-            semantic_colors[robot_arm_mask] = [1.0, 0.0, 0.0]  # 红色 - robot arm
-            semantic_colors[others_mask] = [0.5, 0.5, 0.5]    # 灰色 - others
             
             pcd_semantic = o3d.geometry.PointCloud()
             pcd_semantic.points = o3d.utility.Vector3dVector(points)
-            pcd_semantic.colors = o3d.utility.Vector3dVector(semantic_colors)
+            pcd_semantic.colors = o3d.utility.Vector3dVector(semantics)
             
             # 创建交互式可视化器
             vis = o3d.visualization.Visualizer()
