@@ -506,91 +506,135 @@ def load_camera_annotations(scene_dir):
     
     return cameras_data
 
-def match_timestamps(cameras_data, tolerance_ms=100):
+def binary_search_latest_range(arr, l, r, x):
+    """
+    二分查找：找到小于等于x的最大值（递归实现）
+    参考 rh20t_api/rh20t_api/search.py
+    """
+    if arr[r] <= x or r == l:
+        return arr[r]
+    mid = ((l + r) >> 1) + 1
+    return binary_search_latest_range(arr, mid, r, x) if arr[mid] <= x else binary_search_latest_range(arr, l, mid - 1, x)
+
+def binary_search_latest(arr, x):
+    """
+    在排序数组中查找小于等于x的最大值
+    参考 rh20t_api/rh20t_api/search.py
+    
+    Args:
+        arr: 排序的数组
+        x: 目标值
+    
+    Returns:
+        小于等于x的最大值
+    """
+    if len(arr) <= 0:
+        raise ValueError("input array should contain at least one element")
+    return binary_search_latest_range(arr, 0, len(arr) - 1, x)
+
+def binary_search_closest(t, target_t):
+    """
+    在排序的时间戳列表中找到最接近目标时间戳的值
+    参考 rh20t_api/rh20t_api/search.py 的 binary_search_closest
+    
+    Args:
+        t: 排序的时间戳列表
+        target_t: 目标时间戳
+    
+    Returns:
+        最接近的时间戳值
+    """
+    if target_t in t:
+        return target_t
+    prev_t_idx = t.index(binary_search_latest(t, target_t))
+    if prev_t_idx == len(t) - 1:
+        return t[prev_t_idx]
+    return t[prev_t_idx] if abs(t[prev_t_idx] - target_t) < abs(t[prev_t_idx + 1] - target_t) else t[prev_t_idx + 1]
+
+def match_timestamps(cameras_data, time_interval_ms=100, start_timestamp=None, end_timestamp=None):
     """
     匹配不同相机的时间戳，找到同一时刻的多视角图像
+    参考 rh20t_api/rh20t_api/scene.py 的 get_image_path_pairs_period 方法
+    
+    采用固定时间间隔的方式：
+    1. 首先收集每个相机的时间戳列表
+    2. 确定时间范围（最小和最大时间戳）
+    3. 按固定时间间隔生成查询时间戳序列
+    4. 对每个查询时间戳，使用二分查找找到每个相机最接近的帧
     
     Args:
         cameras_data: 相机数据字典
-        tolerance_ms: 时间戳容差（毫秒）
+        time_interval_ms: 时间间隔（毫秒），用于生成查询时间戳序列
+        start_timestamp: 起始时间戳（如果为None，则使用所有相机中的最小时间戳）
+        end_timestamp: 结束时间戳（如果为None，则使用所有相机中的最大时间戳）
     
     Returns:
         matched_frames: 匹配的帧列表，每个元素是一个字典，包含所有相机的图像信息
     """
-    # 收集所有时间戳
-    all_timestamps = []
+    # 第一步：收集每个相机的时间戳列表（类似 rh20t_api 的 _load_low_freq_timestamps）
+    camera_timestamps = {}  # 字典：相机序列号 -> 排序的时间戳列表
+    camera_timestamp_to_image = {}  # 字典：相机序列号 -> {时间戳: 图像信息}
+    
     for cam_serial, cam_data in cameras_data.items():
+        timestamps = []
+        timestamp_to_image = {}
+        
         for img in cam_data['images']:
             timestamp = img.get('timestamp', {})
             color_ts = timestamp.get('color', None)
             if color_ts is not None:
-                all_timestamps.append((cam_serial, img['id'], color_ts))
+                timestamps.append(color_ts)
+                timestamp_to_image[color_ts] = img
+        
+        # 排序时间戳（类似 rh20t_api 中的 sorted）
+        timestamps = sorted(list(set(timestamps)))  # 去重并排序
+        camera_timestamps[cam_serial] = timestamps
+        camera_timestamp_to_image[cam_serial] = timestamp_to_image
     
-    # 按时间戳排序
-    all_timestamps.sort(key=lambda x: x[2])
+    # 第二步：确定时间范围
+    all_timestamps = []
+    for timestamps in camera_timestamps.values():
+        all_timestamps.extend(timestamps)
     
-    # 匹配时间戳
+    if len(all_timestamps) == 0:
+        return []
+    
+    if start_timestamp is None:
+        start_timestamp = min(all_timestamps)
+    if end_timestamp is None:
+        end_timestamp = max(all_timestamps)
+    
+    # 第三步：按固定时间间隔生成查询时间戳序列（类似 get_image_path_pairs_period）
     matched_frames = []
-    current_group = []
-    current_ts = None
     
-    for cam_serial, img_id, ts in all_timestamps:
-        if current_ts is None or abs(ts - current_ts) <= tolerance_ms:
-            # 属于同一组
-            current_group.append((cam_serial, img_id, ts))
-            if current_ts is None:
-                current_ts = ts
-        else:
-            # 新的一组
-            if len(current_group) > 0:
-                # 创建匹配帧
-                matched_frame = {}
-                for cs, iid, t in current_group:
-                    # 找到对应的图像信息
-                    img_info = None
-                    for img in cameras_data[cs]['images']:
-                        if img['id'] == iid:
-                            img_info = img
-                            break
-                    
-                    if img_info:
-                        matched_frame[cs] = {
-                            'image_id': iid,
-                            'image_info': img_info,
-                            'timestamp': t
-                        }
-                
-                if len(matched_frame) > 0:
-                    matched_frames.append(matched_frame)
-            
-            # 开始新组
-            current_group = [(cam_serial, img_id, ts)]
-            current_ts = ts
-    
-    # 处理最后一组
-    if len(current_group) > 0:
+    for query_timestamp in range(start_timestamp, end_timestamp + 1, time_interval_ms):
+        # 第四步：对每个查询时间戳，使用二分查找找到每个相机最接近的帧（类似 get_image_path_pairs）
         matched_frame = {}
-        for cs, iid, t in current_group:
-            img_info = None
-            for img in cameras_data[cs]['images']:
-                if img['id'] == iid:
-                    img_info = img
-                    break
+        
+        for cam_serial, timestamps in camera_timestamps.items():
+            if len(timestamps) == 0:
+                continue
             
-            if img_info:
-                matched_frame[cs] = {
-                    'image_id': iid,
+            # 使用二分查找找到最接近的时间戳
+            closest_timestamp = binary_search_closest(timestamps, query_timestamp)
+            
+            # 获取对应的图像信息
+            if closest_timestamp in camera_timestamp_to_image[cam_serial]:
+                img_info = camera_timestamp_to_image[cam_serial][closest_timestamp]
+                matched_frame[cam_serial] = {
+                    'image_id': img_info['id'],
                     'image_info': img_info,
-                    'timestamp': t
+                    'timestamp': closest_timestamp
                 }
         
+        # 只有当至少有一个相机的图像被匹配到时，才添加到结果中
         if len(matched_frame) > 0:
             matched_frames.append(matched_frame)
     
     return matched_frames
 
 def process_multiview_pointcloud(scene_dir, output_dir=None, num_frames=None,
-                                 downsample_factor=1.0, min_depth_m=0.3, max_depth_m=1.0,
+                                 downsample_factor=1.0, min_depth_m=0.0, max_depth_m=1.0,
                                  downsample_voxel_size_m=0.0001, filter_num_neighbor=10,
                                  filter_std_ratio=2.0, filter_radius_m=0.01):
     """
@@ -622,9 +666,9 @@ def process_multiview_pointcloud(scene_dir, output_dir=None, num_frames=None,
     
     print(f"找到 {len(cameras_data)} 个相机")
     
-    # 匹配时间戳
+    # 匹配时间戳（参考 rh20t_api 的帧对齐方式）
     print("\n正在匹配时间戳...")
-    matched_frames = match_timestamps(cameras_data, tolerance_ms=100)
+    matched_frames = match_timestamps(cameras_data, time_interval_ms=10)
     print(f"匹配到 {len(matched_frames)} 个多视角帧")
     
     if len(matched_frames) == 0:
@@ -1152,7 +1196,7 @@ if __name__ == "__main__":
                        help="处理的帧数（None表示全部）")
     parser.add_argument("--downsample_factor", type=float, default=1.0,
                        help="图像下采样因子（默认1.0）")
-    parser.add_argument("--min_depth", type=float, default=0.3,
+    parser.add_argument("--min_depth", type=float, default=0.0,
                        help="最小有效深度（米，默认0.3）")
     parser.add_argument("--max_depth", type=float, default=1.0,
                        help="最大有效深度（米，默认1.0）")
