@@ -249,19 +249,24 @@ def merge_pointclouds_with_semantics(pcds_list, semantics_list,
                                      filter_std_ratio=2.0,
                                      filter_radius_m=0.01):
     """
-    合并多个点云并融合语义信息（参考rh20t_api/utils/point_cloud.py）
+    合并多个点云并融合语义信息，并应用Open3D过滤去除游离点和深度错误点
+    
+    过滤步骤（按顺序执行）：
+    1. 体素下采样：减少点云密度，去除重复点
+    2. 统计离群点过滤：移除距离邻居平均距离超过阈值的点（处理深度错误点）
+    3. 半径离群点过滤：移除在指定半径内邻居数量少于阈值的点（处理游离点）
     
     Args:
         pcds_list: 点云列表
         semantics_list: 语义标签列表
-        downsample_voxel_size_m: 体素下采样大小
-        filter_num_neighbor: 统计离群点过滤的邻居数
-        filter_std_ratio: 统计离群点过滤的标准差比例
-        filter_radius_m: 半径离群点过滤的半径
+        downsample_voxel_size_m: 体素下采样大小（米），0表示不进行下采样
+        filter_num_neighbor: 统计离群点过滤的邻居数（推荐10-20）
+        filter_std_ratio: 统计离群点过滤的标准差比例（推荐1.5-2.5，越大越宽松）
+        filter_radius_m: 半径离群点过滤的半径（米，推荐0.01-0.05）
     
     Returns:
-        merged_pcd: 合并后的点云
-        merged_semantics: 合并后的语义标签
+        merged_pcd: 合并并过滤后的点云
+        merged_semantics: 合并并过滤后的语义标签（与点云点数匹配）
     """
     if len(pcds_list) == 0:
         return None, None
@@ -298,8 +303,59 @@ def merge_pointclouds_with_semantics(pcds_list, semantics_list,
     merged_pcd = o3d.geometry.PointCloud()
     merged_pcd.points = o3d.utility.Vector3dVector(merged_points)
     merged_pcd.colors = o3d.utility.Vector3dVector(merged_colors / 255.0)
-    merged_semantics = o3d.utility.Vector3dVector(merged_semantics / 255.0)
+    merged_semantics_array = np.asarray(merged_semantics)
     
+    # 应用体素下采样（如果指定）
+    if downsample_voxel_size_m > 0:
+        num_before = len(merged_pcd.points)
+        merged_pcd = merged_pcd.voxel_down_sample(voxel_size=downsample_voxel_size_m)
+        num_after = len(merged_pcd.points)
+        
+        # 下采样后需要重新匹配语义标签
+        # 使用Open3D的最近邻搜索来匹配下采样后的点到原始点
+        if num_after < num_before:
+            # 创建原始点云的KDTree用于最近邻搜索
+            original_pcd = o3d.geometry.PointCloud()
+            original_pcd.points = o3d.utility.Vector3dVector(merged_points)
+            original_tree = o3d.geometry.KDTreeFlann(original_pcd)
+            
+            # 对每个下采样后的点，找到最近的原始点
+            downsampled_points = np.asarray(merged_pcd.points)
+            downsampled_semantics = []
+            for point in downsampled_points:
+                [_, idx, _] = original_tree.search_knn_vector_3d(point, 1)
+                downsampled_semantics.append(merged_semantics_array[idx[0]])
+            merged_semantics_array = np.array(downsampled_semantics)
+    
+    # 应用统计离群点过滤（移除距离邻居平均距离超过阈值的点）
+    if filter_num_neighbor > 0 and filter_std_ratio > 0:
+        num_before = len(merged_pcd.points)
+        merged_pcd, inlier_indices = merged_pcd.remove_statistical_outlier(
+            nb_neighbors=filter_num_neighbor,
+            std_ratio=filter_std_ratio
+        )
+        # 同步过滤语义标签
+        merged_semantics_array = merged_semantics_array[inlier_indices]
+        num_after = len(merged_pcd.points)
+        # 注意：过滤信息会在调用函数处通过tqdm.write()输出，避免干扰进度条
+    
+    # 应用半径离群点过滤（移除在指定半径内邻居数量少于阈值的点）
+    if filter_radius_m > 0:
+        num_before = len(merged_pcd.points)
+        # 计算合适的邻居数量阈值（基于半径和点云密度）
+        # 使用较小的阈值来移除明显的游离点
+        min_neighbors = max(3, filter_num_neighbor // 2)  # 至少需要3个邻居
+        merged_pcd, inlier_indices = merged_pcd.remove_radius_outlier(
+            nb_points=min_neighbors,
+            radius=filter_radius_m
+        )
+        # 同步过滤语义标签
+        merged_semantics_array = merged_semantics_array[inlier_indices]
+        num_after = len(merged_pcd.points)
+        # 注意：过滤信息会在调用函数处通过tqdm.write()输出，避免干扰进度条
+    
+    # 转换回Vector3dVector格式
+    merged_semantics = o3d.utility.Vector3dVector(merged_semantics_array / 255.0)
     
     return merged_pcd, merged_semantics
 
@@ -346,6 +402,61 @@ end_header
             f.write(struct.pack('<BBB', int(semantics[i][0]),int(semantics[i][1]),int(semantics[i][2])))
     
     return True
+
+def save_pointcloud_metadata(matched_frame, cameras_data, output_path):
+    """
+    保存点云的元数据（记录使用的图像信息）
+    
+    Args:
+        matched_frame: 匹配的帧数据字典，键为相机序列号
+        cameras_data: 相机数据字典
+        output_path: 输出JSON文件路径
+    """
+    metadata = {
+        'query_timestamp': list(matched_frame.values())[0]['timestamp'] if matched_frame else None,
+        'cameras': []
+    }
+    
+    for cam_serial, frame_data in matched_frame.items():
+        cam_data = cameras_data.get(cam_serial, {})
+        img_info = frame_data.get('image_info', {})
+        
+        camera_info = {
+            'serial': cam_serial,
+            'image_id': frame_data.get('image_id'),
+            'timestamp': frame_data.get('timestamp'),
+            'rgb_path': img_info.get('rgb_path', ''),
+            'depth_path': img_info.get('depth_path', ''),
+            'segmentation_path': img_info.get('segmentation_path', ''),
+            'width': img_info.get('width', 640),
+            'height': img_info.get('height', 360)
+        }
+        metadata['cameras'].append(camera_info)
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(metadata, f, indent=2, ensure_ascii=False)
+    
+    return True
+
+def load_pointcloud_metadata(metadata_path):
+    """
+    加载点云的元数据
+    
+    Args:
+        metadata_path: 元数据JSON文件路径
+    
+    Returns:
+        metadata: 元数据字典，如果文件不存在则返回None
+    """
+    if not os.path.exists(metadata_path):
+        return None
+    
+    try:
+        with open(metadata_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: 无法加载元数据文件 {metadata_path}: {e}")
+        return None
 
 def load_camera_annotations(scene_dir):
     """
@@ -448,27 +559,26 @@ def binary_search_closest(t, target_t):
         return t[prev_t_idx]
     return t[prev_t_idx] if abs(t[prev_t_idx] - target_t) < abs(t[prev_t_idx + 1] - target_t) else t[prev_t_idx + 1]
 
-def match_timestamps(cameras_data, time_interval_ms=100, start_timestamp=None, end_timestamp=None):
+def match_timestamps(cameras_data, max_time_diff_ms=50, start_timestamp=None, end_timestamp=None):
     """
     匹配不同相机的时间戳，找到同一时刻的多视角图像
-    参考 rh20t_api/rh20t_api/scene.py 的 get_image_path_pairs_period 方法
     
-    采用固定时间间隔的方式：
-    1. 首先收集每个相机的时间戳列表
-    2. 确定时间范围（最小和最大时间戳）
-    3. 按固定时间间隔生成查询时间戳序列
-    4. 对每个查询时间戳，使用二分查找找到每个相机最接近的帧
+    新的匹配策略：
+    1. 选择帧数最少的相机作为基准相机
+    2. 遍历基准相机的每一帧
+    3. 对于每一帧，在其他相机中查找时间差在max_time_diff_ms内的最接近帧
+    4. 如果所有其他相机都找到了匹配帧，则该帧有效；否则放弃该帧
     
     Args:
         cameras_data: 相机数据字典
-        time_interval_ms: 时间间隔（毫秒），用于生成查询时间戳序列
-        start_timestamp: 起始时间戳（如果为None，则使用所有相机中的最小时间戳）
-        end_timestamp: 结束时间戳（如果为None，则使用所有相机中的最大时间戳）
+        max_time_diff_ms: 最大允许的时间差（毫秒），默认50ms
+        start_timestamp: 起始时间戳（如果为None，则使用基准相机的最小时间戳）
+        end_timestamp: 结束时间戳（如果为None，则使用基准相机的最大时间戳）
     
     Returns:
         matched_frames: 匹配的帧列表，每个元素是一个字典，包含所有相机的图像信息
     """
-    # 第一步：收集每个相机的时间戳列表（类似 rh20t_api 的 _load_low_freq_timestamps）
+    # 第一步：收集每个相机的时间戳列表
     camera_timestamps = {}  # 字典：相机序列号 -> 排序的时间戳列表
     camera_timestamp_to_image = {}  # 字典：相机序列号 -> {时间戳: 图像信息}
     
@@ -483,50 +593,83 @@ def match_timestamps(cameras_data, time_interval_ms=100, start_timestamp=None, e
                 timestamps.append(color_ts)
                 timestamp_to_image[color_ts] = img
         
-        # 排序时间戳（类似 rh20t_api 中的 sorted）
-        timestamps = sorted(list(set(timestamps)))  # 去重并排序
+        # 排序时间戳并去重
+        timestamps = sorted(list(set(timestamps)))
         camera_timestamps[cam_serial] = timestamps
         camera_timestamp_to_image[cam_serial] = timestamp_to_image
     
-    # 第二步：确定时间范围
-    all_timestamps = []
-    for timestamps in camera_timestamps.values():
-        all_timestamps.extend(timestamps)
-    
-    if len(all_timestamps) == 0:
+    if len(camera_timestamps) == 0:
         return []
     
-    if start_timestamp is None:
-        start_timestamp = min(all_timestamps)
-    if end_timestamp is None:
-        end_timestamp = max(all_timestamps)
+    # 第二步：选择帧数最少的相机作为基准相机
+    base_camera = min(camera_timestamps.items(), key=lambda x: len(x[1]))
+    base_cam_serial = base_camera[0]
+    base_timestamps = base_camera[1]
     
-    # 第三步：按固定时间间隔生成查询时间戳序列（类似 get_image_path_pairs_period）
+    if len(base_timestamps) == 0:
+        return []
+    
+    print(f"  选择相机 {base_cam_serial} 作为基准（共 {len(base_timestamps)} 帧）")
+    
+    # 应用时间范围过滤
+    if start_timestamp is not None:
+        base_timestamps = [ts for ts in base_timestamps if ts >= start_timestamp]
+    if end_timestamp is not None:
+        base_timestamps = [ts for ts in base_timestamps if ts <= end_timestamp]
+    
+    if len(base_timestamps) == 0:
+        return []
+    
+    # 第三步：对基准相机的每一帧，查找其他相机的匹配帧
     matched_frames = []
+    skipped_count = 0
     
-    for query_timestamp in range(start_timestamp, end_timestamp + 1, time_interval_ms):
-        # 第四步：对每个查询时间戳，使用二分查找找到每个相机最接近的帧（类似 get_image_path_pairs）
+    for base_timestamp in base_timestamps:
         matched_frame = {}
+        all_cameras_matched = True
         
+        # 添加基准相机的帧
+        base_img_info = camera_timestamp_to_image[base_cam_serial][base_timestamp]
+        matched_frame[base_cam_serial] = {
+            'image_id': base_img_info['id'],
+            'image_info': base_img_info,
+            'timestamp': base_timestamp
+        }
+        
+        # 查找其他相机的匹配帧
         for cam_serial, timestamps in camera_timestamps.items():
-            if len(timestamps) == 0:
+            if cam_serial == base_cam_serial:
                 continue
             
-            # 使用二分查找找到最接近的时间戳
-            closest_timestamp = binary_search_closest(timestamps, query_timestamp)
+            if len(timestamps) == 0:
+                all_cameras_matched = False
+                break
             
-            # 获取对应的图像信息
-            if closest_timestamp in camera_timestamp_to_image[cam_serial]:
+            # 使用二分查找找到最接近的时间戳
+            closest_timestamp = binary_search_closest(timestamps, base_timestamp)
+            time_diff = abs(closest_timestamp - base_timestamp)
+            
+            # 检查时间差是否在允许范围内
+            if time_diff <= max_time_diff_ms:
                 img_info = camera_timestamp_to_image[cam_serial][closest_timestamp]
                 matched_frame[cam_serial] = {
                     'image_id': img_info['id'],
                     'image_info': img_info,
                     'timestamp': closest_timestamp
                 }
+            else:
+                # 时间差超出范围，该帧不匹配
+                all_cameras_matched = False
+                break
         
-        # 只有当至少有一个相机的图像被匹配到时，才添加到结果中
-        if len(matched_frame) > 0:
+        # 只有当所有相机都找到匹配帧时，才添加到结果中
+        if all_cameras_matched and len(matched_frame) == len(camera_timestamps):
             matched_frames.append(matched_frame)
+        else:
+            skipped_count += 1
+    
+    if skipped_count > 0:
+        print(f"  跳过了 {skipped_count} 帧（无法在所有相机中找到{max_time_diff_ms}ms内的匹配帧）")
     
     return matched_frames
 
@@ -563,9 +706,9 @@ def process_multiview_pointcloud(scene_dir, output_dir=None, num_frames=None,
     
     print(f"找到 {len(cameras_data)} 个相机")
     
-    # 匹配时间戳（参考 rh20t_api 的帧对齐方式）
+    # 匹配时间戳（使用帧数最少的相机作为基准）
     print("\n正在匹配时间戳...")
-    matched_frames = match_timestamps(cameras_data, time_interval_ms=10)
+    matched_frames = match_timestamps(cameras_data, max_time_diff_ms=50)
     print(f"匹配到 {len(matched_frames)} 个多视角帧")
     
     if len(matched_frames) == 0:
@@ -649,6 +792,11 @@ def process_multiview_pointcloud(scene_dir, output_dir=None, num_frames=None,
                     timestamp = list(matched_frame.values())[0]['timestamp']
                     output_path = os.path.join(output_dir, f"{timestamp}.ply")
                     save_pointcloud_ply_with_semantics(merged_pcd, merged_semantics, output_path)
+                    
+                    # 保存元数据（记录使用的图像信息）
+                    metadata_path = os.path.join(output_dir, f"{timestamp}.json")
+                    save_pointcloud_metadata(matched_frame, cameras_data, metadata_path)
+                    
                     processed_count += 1
                 else:
                     failed_count += 1
@@ -903,10 +1051,32 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
             robot_arm_count = np.sum(semantics == 1)
             others_count = np.sum(semantics == 2)
             
+            # 加载元数据（显示使用的图像信息）
+            metadata_path = os.path.join(pointcloud_dir, ply_file.replace('.ply', '.json'))
+            metadata = load_pointcloud_metadata(metadata_path)
+            
             print(f"\n点云 {i+1}/{len(ply_files)}: {ply_file}")
             print(f"  总点数: {len(points):,}")
             print(f"  Robot arm点数: {robot_arm_count:,} ({robot_arm_count/len(points)*100:.1f}%)")
             print(f"  Others点数: {others_count:,} ({others_count/len(points)*100:.1f}%)")
+            
+            # 显示使用的图像信息
+            if metadata:
+                query_ts = metadata.get('query_timestamp', 'N/A')
+                print(f"  查询时间戳: {query_ts}")
+                print(f"  使用的相机数量: {len(metadata.get('cameras', []))}")
+                print(f"  使用的图像:")
+                for cam_info in metadata.get('cameras', []):
+                    cam_serial = cam_info.get('serial', 'N/A')
+                    img_ts = cam_info.get('timestamp', 'N/A')
+                    rgb_path = cam_info.get('rgb_path', 'N/A')
+                    depth_path = cam_info.get('depth_path', 'N/A')
+                    print(f"    - 相机 {cam_serial}:")
+                    print(f"        时间戳: {img_ts}")
+                    print(f"        RGB: {rgb_path}")
+                    print(f"        Depth: {depth_path}")
+            else:
+                print(f"  警告: 未找到元数据文件，无法显示使用的图像信息")
             
             # 下采样以加快可视化（如果点太多）
             max_points = 500000
@@ -928,9 +1098,17 @@ def visualize_pointclouds_interactive(scene_dir, num_samples=10):
             pcd_semantic.points = o3d.utility.Vector3dVector(points)
             pcd_semantic.colors = o3d.utility.Vector3dVector(semantics)
             
+            # 构建窗口标题（包含使用的图像信息）
+            window_title = f"点云可视化 {i+1}/{len(ply_files)}: {ply_file}"
+            metadata = load_pointcloud_metadata(os.path.join(pointcloud_dir, ply_file.replace('.ply', '.json')))
+            if metadata:
+                cam_count = len(metadata.get('cameras', []))
+                query_ts = metadata.get('query_timestamp', 'N/A')
+                window_title += f" | 时间戳:{query_ts} | {cam_count}个相机"
+            
             # 创建交互式可视化器
             vis = o3d.visualization.Visualizer()
-            vis.create_window(window_name=f"点云可视化 {i+1}/{len(ply_files)}: {ply_file}",
+            vis.create_window(window_name=window_title,
                             width=1920, height=1080)
             
             # 默认显示语义颜色
@@ -1092,6 +1270,14 @@ if __name__ == "__main__":
                        help="最小有效深度（米，默认0.3）")
     parser.add_argument("--max_depth", type=float, default=1.0,
                        help="最大有效深度（米，默认1.0）")
+    parser.add_argument("--voxel_size", type=float, default=0.0001,
+                       help="点云体素下采样大小（米，默认0.0001，0表示不进行下采样）")
+    parser.add_argument("--filter_neighbors", type=int, default=10,
+                       help="统计离群点过滤的邻居数（默认10，推荐10-20）")
+    parser.add_argument("--filter_std_ratio", type=float, default=2.0,
+                       help="统计离群点过滤的标准差比例（默认2.0，推荐1.5-2.5，越大越宽松）")
+    parser.add_argument("--filter_radius", type=float, default=0.01,
+                       help="半径离群点过滤的半径（米，默认0.01，推荐0.01-0.05）")
     parser.add_argument("--visualize", action="store_true",
                        help="进行交互式可视化")
     parser.add_argument("--num_samples", type=int, default=10,
@@ -1106,7 +1292,11 @@ if __name__ == "__main__":
         num_frames=args.num_frames,
         downsample_factor=args.downsample_factor,
         min_depth_m=args.min_depth,
-        max_depth_m=args.max_depth
+        max_depth_m=args.max_depth,
+        downsample_voxel_size_m=args.voxel_size,
+        filter_num_neighbor=args.filter_neighbors,
+        filter_std_ratio=args.filter_std_ratio,
+        filter_radius_m=args.filter_radius
     )
     
     # 可视化
