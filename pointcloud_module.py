@@ -81,29 +81,21 @@ class PointCloudGenerator:
             pcd: RGB点云
             seg_pcd: 语义点云
         """
-        # 读取图像
+        # 使用PIL读取所有图像（避免OpenCV的libpng兼容性问题）
+        from PIL import Image as PILImage
+        
+        # 读取RGB图像
         try:
-            color_raw = cv2.imread(color_path)
-            if color_raw is None:
-                # 尝试使用PIL读取
-                from PIL import Image as PILImage
-                color_pil = PILImage.open(color_path).convert('RGB')
-                color = np.array(color_pil)
-            else:
-                color = cv2.cvtColor(color_raw, cv2.COLOR_BGR2RGB)
+            color_pil = PILImage.open(color_path).convert('RGB')
+            color = np.array(color_pil)
         except Exception as e:
             print(f"    Warning: 无法读取RGB图像: {color_path}, 错误: {e}")
             return None, None
         
+        # 读取深度图
         try:
-            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
-            if depth_raw is None:
-                # 尝试使用PIL读取
-                from PIL import Image as PILImage
-                depth_pil = PILImage.open(depth_path)
-                depth = np.array(depth_pil).astype(np.float32)
-            else:
-                depth = depth_raw.astype(np.float32)
+            depth_pil = PILImage.open(depth_path)
+            depth = np.array(depth_pil).astype(np.float32)
         except Exception as e:
             print(f"    Warning: 无法读取深度图: {depth_path}, 错误: {e}")
             return None, None
@@ -111,32 +103,23 @@ class PointCloudGenerator:
         # 读取语义分割图
         if seg_path and os.path.exists(seg_path):
             try:
-                segmentation = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
-                if segmentation is None:
-                    # 尝试使用PIL读取
-                    from PIL import Image as PILImage
-                    seg_pil = PILImage.open(seg_path)
-                    segmentation = np.array(seg_pil)
+                seg_pil = PILImage.open(seg_path)
+                segmentation = np.array(seg_pil)
+                
+                # 处理分割图格式
+                if len(segmentation.shape) == 2:
+                    # 灰度图，需要应用调色板转为RGB
+                    if self.palette:
+                        segmentation = self.palette.apply_to_mask(segmentation)
+                    else:
+                        # 转为3通道灰度
+                        segmentation = np.stack([segmentation] * 3, axis=-1)
+                elif len(segmentation.shape) == 3 and segmentation.shape[2] == 4:
+                    # RGBA转RGB
+                    segmentation = segmentation[:, :, :3]
             except Exception as e:
-                # 使用PIL读取
-                try:
-                    from PIL import Image as PILImage
-                    seg_pil = PILImage.open(seg_path)
-                    segmentation = np.array(seg_pil)
-                except Exception as e2:
-                    print(f"    Warning: 无法读取分割图: {seg_path}，使用灰色替代")
-                    segmentation = np.ones_like(color) * 128
-            
-            # 处理分割图格式
-            if len(segmentation.shape) == 2:
-                # 灰度图，需要应用调色板转为RGB
-                if self.palette:
-                    segmentation = self.palette.apply_to_mask(segmentation)
-                else:
-                    segmentation = cv2.cvtColor(segmentation, cv2.COLOR_GRAY2RGB)
-            elif len(segmentation.shape) == 3 and segmentation.shape[2] == 3:
-                # BGR转RGB
-                segmentation = cv2.cvtColor(segmentation, cv2.COLOR_BGR2RGB)
+                print(f"    Warning: 无法读取分割图: {seg_path}，使用灰色替代")
+                segmentation = np.ones_like(color) * 128
         else:
             # 如果没有分割图，使用灰色
             segmentation = np.ones_like(color) * 128
