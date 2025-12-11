@@ -8,7 +8,7 @@ dataset:
   # 数据集根目录
   base_dir: "/home/qiansongtang/Documents/program/rgb2voxel/data"
   # 数据集名称（例如：6cam_dataset）
-  dataset_name: "6cam_dataset"
+  dataset_name: "dataset"
   # 要处理的任务列表，为空则处理所有任务
   # 例如：["task_0001_user_0016_scene_0001_cfg_0003"]
   tasks: []
@@ -37,7 +37,7 @@ segmentation:
   # mask阈值
   mask_threshold: 0.3
   # 是否覆盖已有的分割结果
-  overwrite: false
+  overwrite: true
   
 # ==============================================================================
 # 调色板配置
@@ -94,7 +94,7 @@ pointcloud:
   # 输出文件夹名称（在任务文件夹下）
   output_folder: "POINTCLOUDS"
   # 是否覆盖已有的点云数据
-  overwrite: false
+  overwrite: true
 
 # ==============================================================================
 # 体素化配置
@@ -107,7 +107,7 @@ voxelization:
   # 输出文件夹名称（在任务文件夹下）
   output_folder: "VOXELS"
   # 是否覆盖已有的体素数据
-  overwrite: false
+  overwrite: true
 
 # ==============================================================================
 # 流程控制

@@ -82,19 +82,60 @@ class PointCloudGenerator:
             seg_pcd: 语义点云
         """
         # 读取图像
-        color = cv2.cvtColor(cv2.imread(color_path), cv2.COLOR_BGR2RGB)
-        depth = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED).astype(np.float32)
+        try:
+            color_raw = cv2.imread(color_path)
+            if color_raw is None:
+                # 尝试使用PIL读取
+                from PIL import Image as PILImage
+                color_pil = PILImage.open(color_path).convert('RGB')
+                color = np.array(color_pil)
+            else:
+                color = cv2.cvtColor(color_raw, cv2.COLOR_BGR2RGB)
+        except Exception as e:
+            print(f"    Warning: 无法读取RGB图像: {color_path}, 错误: {e}")
+            return None, None
+        
+        try:
+            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            if depth_raw is None:
+                # 尝试使用PIL读取
+                from PIL import Image as PILImage
+                depth_pil = PILImage.open(depth_path)
+                depth = np.array(depth_pil).astype(np.float32)
+            else:
+                depth = depth_raw.astype(np.float32)
+        except Exception as e:
+            print(f"    Warning: 无法读取深度图: {depth_path}, 错误: {e}")
+            return None, None
         
         # 读取语义分割图
         if seg_path and os.path.exists(seg_path):
-            segmentation = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
+            try:
+                segmentation = cv2.imread(seg_path, cv2.IMREAD_UNCHANGED)
+                if segmentation is None:
+                    # 尝试使用PIL读取
+                    from PIL import Image as PILImage
+                    seg_pil = PILImage.open(seg_path)
+                    segmentation = np.array(seg_pil)
+            except Exception as e:
+                # 使用PIL读取
+                try:
+                    from PIL import Image as PILImage
+                    seg_pil = PILImage.open(seg_path)
+                    segmentation = np.array(seg_pil)
+                except Exception as e2:
+                    print(f"    Warning: 无法读取分割图: {seg_path}，使用灰色替代")
+                    segmentation = np.ones_like(color) * 128
+            
+            # 处理分割图格式
             if len(segmentation.shape) == 2:
                 # 灰度图，需要应用调色板转为RGB
                 if self.palette:
                     segmentation = self.palette.apply_to_mask(segmentation)
                 else:
                     segmentation = cv2.cvtColor(segmentation, cv2.COLOR_GRAY2RGB)
-            else:
+            elif len(segmentation.shape) == 3 and segmentation.shape[2] == 3:
+                # BGR转RGB
                 segmentation = cv2.cvtColor(segmentation, cv2.COLOR_BGR2RGB)
         else:
             # 如果没有分割图，使用灰色
@@ -320,7 +361,8 @@ end_header
     
     def load_camera_data(self, task_dir: str) -> Dict:
         """
-        加载所有相机的数据（不依赖annotations.json）
+        加载所有相机的数据
+        优先从task目录的metadata.json读取相机参数，其次从calib目录读取
         
         Args:
             task_dir: 任务目录路径
@@ -330,21 +372,38 @@ end_header
         """
         cameras_data = {}
         
-        # 获取标定目录
-        task_name = os.path.basename(task_dir)
-        calib_dir = self.config.get_calib_dir(task_name)
+        # 优先从metadata.json读取相机参数
+        metadata_path = os.path.join(task_dir, "metadata.json")
+        metadata_cameras = {}
         
-        # 加载内参和外参
+        if os.path.exists(metadata_path):
+            try:
+                with open(metadata_path, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+                metadata_cameras = metadata.get('cameras', {})
+                if metadata_cameras:
+                    print(f"  从metadata.json加载相机参数")
+            except Exception as e:
+                print(f"  Warning: 无法读取metadata.json: {e}")
+        
+        # 如果metadata.json中没有相机参数，从calib目录读取
         intrinsics_dict = {}
         extrinsics_dict = {}
-        if calib_dir and os.path.exists(calib_dir):
-            intrinsics_path = os.path.join(calib_dir, "intrinsics.npy")
-            extrinsics_path = os.path.join(calib_dir, "extrinsics.npy")
+        if not metadata_cameras:
+            task_name = os.path.basename(task_dir)
+            calib_dir = self.config.get_calib_dir(task_name)
             
-            if os.path.exists(intrinsics_path):
-                intrinsics_dict = load_dict_npy(intrinsics_path)
-            if os.path.exists(extrinsics_path):
-                extrinsics_dict = load_dict_npy(extrinsics_path)
+            if calib_dir and os.path.exists(calib_dir):
+                intrinsics_path = os.path.join(calib_dir, "intrinsics.npy")
+                extrinsics_path = os.path.join(calib_dir, "extrinsics.npy")
+                
+                if os.path.exists(intrinsics_path):
+                    intrinsics_dict = load_dict_npy(intrinsics_path)
+                if os.path.exists(extrinsics_path):
+                    extrinsics_dict = load_dict_npy(extrinsics_path)
+                
+                if intrinsics_dict or extrinsics_dict:
+                    print(f"  从calib目录加载相机参数")
         
         # 遍历相机文件夹
         for item in os.listdir(task_dir):
@@ -353,6 +412,7 @@ end_header
                 continue
             
             cam_serial = item.replace('cam_', '')
+            cam_key = f"cam_{cam_serial}"  # metadata.json中的key格式
             
             # 获取图像列表
             color_dir = os.path.join(cam_dir, 'color')
@@ -392,19 +452,30 @@ end_header
                     'timestamp': {'color': timestamp, 'depth': timestamp, 'segmentation': timestamp}
                 })
             
-            # 获取内参和外参
-            intrinsic = intrinsics_dict.get(cam_serial)
-            extrinsic = extrinsics_dict.get(cam_serial)
+            # 获取内参和外参（优先从metadata.json）
+            intrinsic = None
+            extrinsic = None
             
-            if intrinsic is not None:
-                intrinsic = np.array(intrinsic)
-                if intrinsic.shape[1] > 3:
-                    intrinsic = intrinsic[:3, :3]
+            if cam_key in metadata_cameras:
+                # 从metadata.json读取
+                cam_info = metadata_cameras[cam_key]
+                intrinsic = np.array(cam_info.get('intrinsic'))
+                extrinsic = np.array(cam_info.get('extrinsic'))
+            else:
+                # 从calib目录读取
+                intrinsic = intrinsics_dict.get(cam_serial)
+                extrinsic = extrinsics_dict.get(cam_serial)
+                
+                if intrinsic is not None:
+                    intrinsic = np.array(intrinsic)
+                if extrinsic is not None:
+                    extrinsic = np.array(extrinsic)
+                    if isinstance(extrinsic, list) or (isinstance(extrinsic, np.ndarray) and len(extrinsic.shape) > 2):
+                        extrinsic = extrinsic[0] if len(extrinsic) > 0 else np.eye(4)
             
-            if extrinsic is not None:
-                extrinsic = np.array(extrinsic)
-                if isinstance(extrinsic, list) or (isinstance(extrinsic, np.ndarray) and len(extrinsic.shape) > 2):
-                    extrinsic = extrinsic[0] if len(extrinsic) > 0 else np.eye(4)
+            # 确保内参是3x3矩阵
+            if intrinsic is not None and intrinsic.shape[1] > 3:
+                intrinsic = intrinsic[:3, :3]
             
             cameras_data[cam_serial] = {
                 'serial': cam_serial,
@@ -577,27 +648,39 @@ end_header
                     depth_path = os.path.join(cam_data['dir'], img_info['depth_path'])
                     seg_path = os.path.join(cam_data['dir'], img_info.get('segmentation_path', ''))
                     
-                    # 检查文件
-                    if not os.path.exists(rgb_path) or not os.path.exists(depth_path):
+                    # 检查文件是否存在
+                    if not os.path.exists(rgb_path):
+                        tqdm.write(f"    跳过 {cam_serial}: RGB文件不存在 {rgb_path}")
+                        continue
+                    if not os.path.exists(depth_path):
+                        tqdm.write(f"    跳过 {cam_serial}: 深度图不存在 {depth_path}")
                         continue
                     
                     intrinsic = cam_data.get('intrinsic')
                     extrinsic = cam_data.get('extrinsic')
                     
-                    if intrinsic is None or extrinsic is None:
+                    if intrinsic is None:
+                        tqdm.write(f"    跳过 {cam_serial}: 无内参矩阵")
+                        continue
+                    if extrinsic is None:
+                        tqdm.write(f"    跳过 {cam_serial}: 无外参矩阵")
                         continue
                     
                     # 生成点云
-                    pcd, seg_pcd = self.rgbd_to_pointcloud(
-                        rgb_path, depth_path, seg_path,
-                        img_info.get('width', 640),
-                        img_info.get('height', 360),
-                        intrinsic, extrinsic
-                    )
-                    
-                    if pcd is not None and len(pcd.points) > 0:
-                        pcds_list.append(pcd)
-                        semantics_list.append(seg_pcd)
+                    try:
+                        pcd, seg_pcd = self.rgbd_to_pointcloud(
+                            rgb_path, depth_path, seg_path,
+                            img_info.get('width', 640),
+                            img_info.get('height', 360),
+                            intrinsic, extrinsic
+                        )
+                        
+                        if pcd is not None and len(pcd.points) > 0:
+                            pcds_list.append(pcd)
+                            semantics_list.append(seg_pcd)
+                    except Exception as e:
+                        tqdm.write(f"    相机 {cam_serial} 点云生成失败: {e}")
+                        continue
                 
                 # 合并点云
                 if len(pcds_list) > 0:
