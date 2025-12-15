@@ -152,16 +152,22 @@ class Dataset2Converter:
         
         return timestamps
     
-    def _convert_depth_to_png(self, src_dir: Path, dst_dir: Path, timestamps: List[int]) -> Dict:
+    def _convert_depth_to_png(self, src_dir: Path, dst_dir: Path, timestamps: List[int],
+                               cam_idx: int = 0) -> Dict:
         """
         将深度 NPY 数据转换为 PNG 图像
         
-        深度数据通常以米为单位的浮点数，需要转换为 16位 PNG（毫米）
+        深度数据是欧几里得深度（distance_to_camera，射线深度），需要转换为 Z 深度（平面深度）
+        然后转换为 16位 PNG（毫米）
+        
+        欧几里得深度：从相机中心到3D点的直线距离
+        Z深度：沿相机Z轴的距离（Open3D期望的格式）
         
         Args:
             src_dir: 源目录
             dst_dir: 目标目录
             timestamps: 时间戳列表（与 RGB 对应）
+            cam_idx: 相机索引，用于获取内参
         
         Returns:
             深度数据统计信息
@@ -177,21 +183,51 @@ class Dataset2Converter:
         if not src_dir.exists():
             return depth_stats
         
+        # 获取相机内参用于深度转换
+        fx, fy, cx, cy = None, None, None, None
+        width, height = 640, 480  # 默认值
+        
+        if self.camera_info and 'cameras' in self.camera_info:
+            cameras = self.camera_info['cameras']
+            if cam_idx < len(cameras):
+                cam = cameras[cam_idx]
+                fx = cam.get('fx', cam.get('intrinsic_matrix', [[763.54]])[0][0])
+                fy = cam.get('fy', cam.get('intrinsic_matrix', [[0], [784.83]])[1][1])
+                cx = cam.get('cx', cam.get('intrinsic_matrix', [[0, 0, 320]])[0][2])
+                cy = cam.get('cy', cam.get('intrinsic_matrix', [[0], [0], [0, 0, 240]])[1][2])
+                resolution = cam.get('resolution', [640, 480])
+                width, height = resolution[0], resolution[1]
+        
+        # 如果没有内参，使用默认值
+        if fx is None:
+            fx, fy = 763.54, 784.83
+            cx, cy = 320.0, 240.0
+        
+        # 预计算欧几里得深度到Z深度的转换因子
+        # z_depth = euclidean_depth / sqrt(x_norm^2 + y_norm^2 + 1)
+        u, v = np.meshgrid(np.arange(width), np.arange(height))
+        x_norm = (u - cx) / fx
+        y_norm = (v - cy) / fy
+        euclidean_to_z_factor = 1.0 / np.sqrt(x_norm**2 + y_norm**2 + 1)
+        
         # 获取所有 NPY 文件
         npy_files = sorted(src_dir.glob("*.npy"))
         
         for idx, npy_file in enumerate(npy_files):
             depth_data = np.load(npy_file)
             
-            # 统计深度范围
-            valid_depth = depth_data[depth_data > 0]
+            # 将欧几里得深度转换为Z深度
+            z_depth = depth_data * euclidean_to_z_factor
+            
+            # 统计深度范围（转换后的Z深度）
+            valid_depth = z_depth[z_depth > 0]
             if len(valid_depth) > 0:
                 depth_stats['min_depth'] = min(depth_stats['min_depth'], float(valid_depth.min()))
                 depth_stats['max_depth'] = max(depth_stats['max_depth'], float(valid_depth.max()))
                 depth_stats['count'] += 1
             
             # 将深度数据转换为毫米单位的 16 位整数
-            depth_mm = (depth_data * 1000).astype(np.uint16)
+            depth_mm = (z_depth * 1000).astype(np.uint16)
             
             # 使用时间戳作为文件名
             timestamp = timestamps[idx] if idx < len(timestamps) else (1000000000000 + idx * 100)
@@ -420,7 +456,7 @@ class Dataset2Converter:
             all_depth_stats = []
             
             # 转换每个相机的数据
-            for cam_name, replicator_dir in replicator_dirs:
+            for cam_idx, (cam_name, replicator_dir) in enumerate(replicator_dirs):
                 print(f"  转换相机: {cam_name}")
                 cam_dir = task_dir / cam_name
                 
@@ -431,9 +467,10 @@ class Dataset2Converter:
                 print(f"    - 转换了 {len(timestamps)} 张 RGB 图像")
                 
                 # 转换深度数据（使用相同的时间戳命名）
+                # 注意：原始深度是欧几里得深度（distance_to_camera），需要转换为Z深度
                 depth_src = replicator_dir / "distance_to_camera"
                 depth_dst = cam_dir / "depth"
-                depth_stats = self._convert_depth_to_png(depth_src, depth_dst, timestamps)
+                depth_stats = self._convert_depth_to_png(depth_src, depth_dst, timestamps, cam_idx)
                 all_depth_stats.append(depth_stats)
                 depth_count = len(list(depth_dst.glob("*.png"))) if depth_dst.exists() else 0
                 print(f"    - 转换了 {depth_count} 张深度图像")

@@ -45,7 +45,6 @@ class PointCloudGenerator:
         self.palette = palette
         
         # 点云生成参数
-        self.downsample_factor = config.get('pointcloud.downsample_factor', 1.0)
         self.min_depth = config.get('pointcloud.min_depth', 0.0)
         self.max_depth = config.get('pointcloud.max_depth', 1.0)
         self.depth_scale = config.get('pointcloud.depth_scale', 1000.0)
@@ -130,16 +129,6 @@ class PointCloudGenerator:
         
         original_height, original_width = depth.shape
         
-        # 下采样
-        if self.downsample_factor != 1.0:
-            new_width = int(width / self.downsample_factor)
-            new_height = int(height / self.downsample_factor)
-            color = cv2.resize(color, (new_width, new_height))
-            depth = cv2.resize(depth, (new_width, new_height))
-            segmentation = cv2.resize(segmentation, (new_width, new_height), 
-                                      interpolation=cv2.INTER_NEAREST)
-            height, width = new_height, new_width
-        
         # 深度转换：从毫米到米
         depth = depth / self.depth_scale
         
@@ -193,10 +182,10 @@ class PointCloudGenerator:
                 # 内参已经匹配当前分辨率
                 intrinsic_scale = 1.0
         
-        fx = intrinsic_scale * raw_fx / self.downsample_factor
-        fy = intrinsic_scale * raw_fy / self.downsample_factor
-        cx = intrinsic_scale * raw_cx / self.downsample_factor
-        cy = intrinsic_scale * raw_cy / self.downsample_factor
+        fx = intrinsic_scale * raw_fx
+        fy = intrinsic_scale * raw_fy
+        cx = intrinsic_scale * raw_cx
+        cy = intrinsic_scale * raw_cy
         
         intrinsic_o3d.set_intrinsics(width, height, fx, fy, cx, cy)
         
