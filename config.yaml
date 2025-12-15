@@ -103,7 +103,9 @@ voxelization:
   # 体素网格大小
   voxel_size: 64
   # 物理空间大小（米）
-  physical_size: 1.26
+  # 注意：需要根据点云实际范围设置，应大于等于点云最大跨度
+  # dataset: ~1.26米, dataset2: ~6米
+  physical_size: 6.0
   # 输出文件夹名称（在任务文件夹下）
   output_folder: "VOXELS"
   # 是否覆盖已有的体素数据

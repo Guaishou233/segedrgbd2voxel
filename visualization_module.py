@@ -288,6 +288,194 @@ class VoxelVisualizer:
             
             return pcd
     
+    def load_single_npy(self, npy_path: str) -> Tuple[np.ndarray, Dict]:
+        """
+        加载单个 NPY 文件
+        
+        会自动检测同目录下的其他相关文件（grid, colors, semantics, metadata）
+        
+        Args:
+            npy_path: NPY 文件路径
+        
+        Returns:
+            data: 加载的数据
+            metadata: 元数据（包含文件类型信息）
+        """
+        npy_path = Path(npy_path)
+        parent_dir = npy_path.parent
+        filename = npy_path.name
+        
+        # 检测文件类型
+        file_type = 'unknown'
+        if 'grid' in filename.lower():
+            file_type = 'grid'
+        elif 'color' in filename.lower():
+            file_type = 'colors'
+        elif 'semantic' in filename.lower():
+            file_type = 'semantics'
+        
+        data = np.load(npy_path)
+        
+        # 尝试加载元数据
+        metadata = {'file_type': file_type, 'source_file': str(npy_path)}
+        metadata_path = parent_dir / "voxel_metadata.json"
+        if metadata_path.exists():
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                metadata.update(json.load(f))
+        
+        return data, metadata
+    
+    def visualize_npy(self, npy_path: str, 
+                      render_mode: str = 'cube',
+                      show_coordinate_frame: bool = True,
+                      show_bounding_box: bool = True) -> None:
+        """
+        直接可视化单个 NPY 文件
+        
+        会自动加载同目录下的相关文件来获取完整信息
+        
+        Args:
+            npy_path: NPY 文件路径
+            render_mode: 渲染模式 - 'cube' 立方体, 'point' 点云
+            show_coordinate_frame: 是否显示坐标系
+            show_bounding_box: 是否显示边界框
+        """
+        npy_path = Path(npy_path)
+        parent_dir = npy_path.parent
+        filename = npy_path.name
+        
+        print(f"加载体素文件: {npy_path}")
+        
+        # 加载主文件
+        data, metadata = self.load_single_npy(npy_path)
+        file_type = metadata.get('file_type', 'unknown')
+        
+        print(f"文件类型: {file_type}")
+        print(f"数据形状: {data.shape}")
+        
+        # 根据文件类型决定如何处理
+        if file_type == 'grid':
+            voxel_grid = data.astype(bool)
+            # 尝试加载颜色
+            colors_path = parent_dir / "voxel_colors.npy"
+            if colors_path.exists():
+                voxel_colors = np.load(colors_path)
+            else:
+                # 使用默认颜色
+                voxel_colors = np.ones((*voxel_grid.shape, 3), dtype=np.uint8) * 128
+            window_title = f"体素网格 - {filename}"
+            
+        elif file_type == 'colors':
+            voxel_colors = data
+            # 尝试加载网格
+            grid_path = parent_dir / "voxel_grid.npy"
+            if grid_path.exists():
+                voxel_grid = np.load(grid_path).astype(bool)
+            else:
+                # 从颜色数据推断占用情况（非零颜色 = 占用）
+                voxel_grid = np.any(voxel_colors > 0, axis=-1)
+            window_title = f"体素颜色 - {filename}"
+            
+        elif file_type == 'semantics':
+            voxel_colors = data  # 语义颜色用于显示
+            # 尝试加载网格
+            grid_path = parent_dir / "voxel_grid.npy"
+            if grid_path.exists():
+                voxel_grid = np.load(grid_path).astype(bool)
+            else:
+                # 从语义数据推断占用情况
+                voxel_grid = np.any(voxel_colors > 0, axis=-1)
+            window_title = f"体素语义 - {filename}"
+            
+        else:
+            # 未知类型，尝试智能处理
+            if len(data.shape) == 3:
+                # 可能是 grid
+                voxel_grid = data.astype(bool)
+                voxel_colors = np.ones((*voxel_grid.shape, 3), dtype=np.uint8) * 128
+            elif len(data.shape) == 4 and data.shape[-1] == 3:
+                # 可能是 colors 或 semantics
+                voxel_colors = data
+                voxel_grid = np.any(voxel_colors > 0, axis=-1)
+            else:
+                print(f"错误: 无法识别的数据格式: {data.shape}")
+                return
+            window_title = f"体素数据 - {filename}"
+        
+        # 获取元数据
+        voxel_resolution = metadata.get('voxel_resolution', 0.02)
+        voxel_origin_dict = metadata.get('voxel_origin', {'x': 0, 'y': 0, 'z': 0})
+        voxel_origin = np.array([
+            voxel_origin_dict.get('x', 0),
+            voxel_origin_dict.get('y', 0),
+            voxel_origin_dict.get('z', 0)
+        ])
+        
+        # 打印统计信息
+        print(f"体素网格大小: {voxel_grid.shape}")
+        print(f"占用体素数: {np.sum(voxel_grid)}")
+        print(f"占用率: {np.sum(voxel_grid) / voxel_grid.size * 100:.2f}%")
+        print(f"体素分辨率: {voxel_resolution} 米")
+        
+        # 创建可视化窗口
+        vis = o3d.visualization.Visualizer()
+        vis.create_window(window_name=window_title, width=1280, height=720)
+        
+        # 根据渲染模式创建几何体
+        use_cubes = (render_mode == 'cube')
+        
+        print(f"\n正在生成{'立方体' if use_cubes else '点云'}网格...")
+        geometry = self.voxel_to_mesh(voxel_grid, voxel_colors, 
+                                      voxel_origin, voxel_resolution, use_cubes)
+        
+        if geometry is None:
+            print("错误: 没有占用的体素")
+            return
+        
+        vis.add_geometry(geometry)
+        
+        # 添加坐标系
+        if show_coordinate_frame:
+            coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(
+                size=0.1, origin=[0, 0, 0]
+            )
+            vis.add_geometry(coord_frame)
+        
+        # 添加边界框
+        if show_bounding_box:
+            physical_size = metadata.get('physical_size', voxel_resolution * voxel_grid.shape[0])
+            bbox_min = voxel_origin
+            bbox_max = voxel_origin + physical_size
+            
+            bbox = o3d.geometry.AxisAlignedBoundingBox(
+                min_bound=bbox_min,
+                max_bound=bbox_max
+            )
+            bbox.color = (0.5, 0.5, 0.5)
+            vis.add_geometry(bbox)
+        
+        # 设置渲染选项
+        render_opt = vis.get_render_option()
+        render_opt.background_color = np.array([0.1, 0.1, 0.1])
+        
+        if not use_cubes:
+            render_opt.point_size = 5.0
+        
+        # 设置视角
+        view_ctrl = vis.get_view_control()
+        view_ctrl.set_zoom(0.8)
+        
+        print("\n可视化控制:")
+        print("  鼠标左键: 旋转")
+        print("  鼠标滚轮: 缩放")
+        print("  鼠标右键: 平移")
+        print("  Q/Esc: 退出")
+        print("  R: 重置视角")
+        
+        # 运行可视化
+        vis.run()
+        vis.destroy_window()
+    
     def visualize(self, voxel_dir: str, mode: str = 'rgb',
                   render_mode: str = 'cube',
                   show_coordinate_frame: bool = True,
@@ -461,6 +649,37 @@ def select_voxel_directory() -> Optional[str]:
         return None
 
 
+def select_npy_file() -> Optional[str]:
+    """
+    使用文件对话框选择 NPY 文件
+    
+    Returns:
+        选择的文件路径，如果取消则返回None
+    """
+    if USE_TKINTER:
+        root = tk.Tk()
+        root.withdraw()
+        
+        file_path = filedialog.askopenfilename(
+            title="选择体素 NPY 文件",
+            filetypes=[
+                ("NPY文件", "*.npy"),
+                ("所有文件", "*.*")
+            ]
+        )
+        
+        root.destroy()
+        
+        if file_path:
+            return file_path
+        return None
+    else:
+        file_path = input("请输入 NPY 文件路径: ").strip()
+        if file_path and os.path.exists(file_path):
+            return file_path
+        return None
+
+
 def interactive_menu():
     """交互式菜单"""
     print("\n" + "=" * 60)
@@ -470,10 +689,11 @@ def interactive_menu():
     while True:
         print("\n请选择操作:")
         print("  1. 可视化点云文件 (PLY)")
-        print("  2. 可视化体素网格 (NPY)")
-        print("  3. 退出")
+        print("  2. 可视化体素目录 (包含多个 NPY)")
+        print("  3. 可视化单个体素文件 (NPY)")
+        print("  4. 退出")
         
-        choice = input("\n请输入选项 (1/2/3): ").strip()
+        choice = input("\n请输入选项 (1/2/3/4): ").strip()
         
         if choice == '1':
             # 点云可视化
@@ -497,7 +717,7 @@ def interactive_menu():
                 print("未选择文件")
         
         elif choice == '2':
-            # 体素可视化
+            # 体素目录可视化
             print("\n选择体素数据目录...")
             voxel_dir = select_voxel_directory()
             
@@ -525,6 +745,27 @@ def interactive_menu():
                 print("未选择目录")
         
         elif choice == '3':
+            # 单个 NPY 文件可视化
+            print("\n选择体素 NPY 文件...")
+            npy_path = select_npy_file()
+            
+            if npy_path:
+                print(f"\n选择的文件: {npy_path}")
+                
+                # 选择渲染模式
+                print("\n渲染模式:")
+                print("  1. 立方体 (更直观但较慢)")
+                print("  2. 点云 (更快)")
+                render_choice = input("请选择 (1/2, 默认1): ").strip()
+                render_mode = 'point' if render_choice == '2' else 'cube'
+                
+                # 可视化
+                visualizer = VoxelVisualizer()
+                visualizer.visualize_npy(npy_path, render_mode=render_mode)
+            else:
+                print("未选择文件")
+        
+        elif choice == '4':
             print("\n退出程序")
             break
         
@@ -548,11 +789,15 @@ def main():
   # 可视化点云的语义颜色
   python visualization_module.py --pointcloud /path/to/pointcloud.ply --mode semantic
   
-  # 可视化体素网格
+  # 可视化体素目录
   python visualization_module.py --voxel /path/to/voxel_dir
   
-  # 可视化体素网格的语义颜色，使用点云渲染
+  # 可视化体素目录的语义颜色，使用点云渲染
   python visualization_module.py --voxel /path/to/voxel_dir --mode semantic --render point
+  
+  # 直接可视化单个 NPY 文件
+  python visualization_module.py --npy /path/to/voxel_colors.npy
+  python visualization_module.py --npy /path/to/voxel_semantics.npy --render point
         """
     )
     
@@ -568,6 +813,13 @@ def main():
         type=str,
         default=None,
         help="体素数据目录路径"
+    )
+    
+    parser.add_argument(
+        "--npy", "-n",
+        type=str,
+        default=None,
+        help="体素 NPY 文件路径 (voxel_grid.npy, voxel_colors.npy, voxel_semantics.npy)"
     )
     
     parser.add_argument(
@@ -608,7 +860,7 @@ def main():
     args = parser.parse_args()
     
     # 如果没有指定文件，进入交互模式
-    if args.pointcloud is None and args.voxel is None:
+    if args.pointcloud is None and args.voxel is None and args.npy is None:
         interactive_menu()
         return
     
@@ -626,7 +878,7 @@ def main():
             show_coordinate_frame=not args.no_coord_frame
         )
     
-    # 可视化体素
+    # 可视化体素目录
     if args.voxel:
         if not os.path.exists(args.voxel):
             print(f"错误: 目录不存在: {args.voxel}")
@@ -640,6 +892,20 @@ def main():
         visualizer.visualize(
             args.voxel,
             mode=args.mode,
+            render_mode=args.render,
+            show_coordinate_frame=not args.no_coord_frame,
+            show_bounding_box=not args.no_bbox
+        )
+    
+    # 可视化单个 NPY 文件
+    if args.npy:
+        if not os.path.exists(args.npy):
+            print(f"错误: 文件不存在: {args.npy}")
+            return
+        
+        visualizer = VoxelVisualizer()
+        visualizer.visualize_npy(
+            args.npy,
             render_mode=args.render,
             show_coordinate_frame=not args.no_coord_frame,
             show_bounding_box=not args.no_bbox
