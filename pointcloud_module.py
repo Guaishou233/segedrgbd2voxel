@@ -61,6 +61,10 @@ class PointCloudGenerator:
         # 输出配置
         self.output_folder = config.get('pointcloud.output_folder', 'POINTCLOUDS')
         self.overwrite = config.get('pointcloud.overwrite', False)
+        
+        # 内参缩放因子（从元数据读取或自动检测）
+        # None 表示自动检测
+        self.intrinsic_scale = None
     
     def rgbd_to_pointcloud(self, color_path: str, depth_path: str, 
                            seg_path: str, width: int, height: int,
@@ -148,24 +152,52 @@ class PointCloudGenerator:
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         segmentation_o3d = o3d.geometry.Image(segmentation.astype(np.uint8))
         
+        # depth_trunc 设置为与 max_depth 相同，确保不会截断有效深度
         rgbd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color_o3d, depth_o3d,
             depth_scale=1.0,
+            depth_trunc=self.max_depth,
             convert_rgb_to_intensity=False
         )
         
         segd_image = o3d.geometry.RGBDImage.create_from_color_and_depth(
             segmentation_o3d, depth_o3d,
             depth_scale=1.0,
+            depth_trunc=self.max_depth,
             convert_rgb_to_intensity=False
         )
         
         # 设置内参
+        # 自动检测内参是否需要缩放：
+        # 如果 cx 大于 width 或 cy 大于 height，说明内参是针对更高分辨率的图像
+        # 需要进行缩放以匹配当前图像尺寸
         intrinsic_o3d = o3d.camera.PinholeCameraIntrinsic()
-        fx = 0.5 * intrinsic[0, 0] / self.downsample_factor
-        fy = 0.5 * intrinsic[1, 1] / self.downsample_factor
-        cx = 0.5 * intrinsic[0, 2] / self.downsample_factor
-        cy = 0.5 * intrinsic[1, 2] / self.downsample_factor
+        
+        raw_fx = intrinsic[0, 0]
+        raw_fy = intrinsic[1, 1]
+        raw_cx = intrinsic[0, 2]
+        raw_cy = intrinsic[1, 2]
+        
+        # 检测内参是否需要缩放
+        # 如果 cx 明显大于 width 或 cy 明显大于 height，说明需要缩放
+        intrinsic_scale = self.intrinsic_scale  # 从元数据获取的缩放因子
+        
+        if intrinsic_scale is None:
+            # 自动检测：如果 cx > width 或 cy > height，计算缩放因子
+            if raw_cx > width * 1.2 or raw_cy > height * 1.2:
+                # 内参是针对更高分辨率的，需要缩放
+                scale_x = width / (raw_cx * 2) if raw_cx > 0 else 1.0
+                scale_y = height / (raw_cy * 2) if raw_cy > 0 else 1.0
+                intrinsic_scale = min(scale_x, scale_y)
+            else:
+                # 内参已经匹配当前分辨率
+                intrinsic_scale = 1.0
+        
+        fx = intrinsic_scale * raw_fx / self.downsample_factor
+        fy = intrinsic_scale * raw_fy / self.downsample_factor
+        cx = intrinsic_scale * raw_cx / self.downsample_factor
+        cy = intrinsic_scale * raw_cy / self.downsample_factor
+        
         intrinsic_o3d.set_intrinsics(width, height, fx, fy, cx, cy)
         
         # 创建点云
@@ -364,6 +396,12 @@ end_header
                 with open(metadata_path, 'r', encoding='utf-8') as f:
                     metadata = json.load(f)
                 metadata_cameras = metadata.get('cameras', {})
+                
+                # 读取内参缩放因子（如果存在）
+                if 'intrinsic_scale' in metadata:
+                    self.intrinsic_scale = metadata['intrinsic_scale']
+                    print(f"  从metadata.json读取内参缩放因子: {self.intrinsic_scale}")
+                
                 if metadata_cameras:
                     print(f"  从metadata.json加载相机参数")
             except Exception as e:

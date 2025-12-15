@@ -8,7 +8,7 @@ dataset:
   # 数据集根目录
   base_dir: "/home/qiansongtang/Documents/program/rgb2voxel/data"
   # 数据集名称（例如：6cam_dataset）
-  dataset_name: "dataset"
+  dataset_name: "dataset2"
   # 要处理的任务列表，为空则处理所有任务
   # 例如：["task_0001_user_0016_scene_0001_cfg_0003"]
   tasks: []
@@ -25,8 +25,8 @@ segmentation:
   # 格式：{label: "文本提示", id: 类别ID}
   # 注意：背景类别会自动添加，ID为最后一个ID+1
   targets:
-    - label: "robot arm"
-      prompt: "robot arm"
+    - label: "clothe"
+      prompt: "clothe"
       id: 1
   # 背景类别配置
   background:
@@ -47,8 +47,8 @@ color_palette:
   # 颜色格式：RGB (0-255)
   # 可以使用预定义的颜色名称或自定义RGB值
   colors:
-    1:  # robot arm
-      name: "robot_arm"
+    1:  # clothe
+      name: "clothe"
       color: [255, 0, 0]  # 红色
     2:  # background  
       name: "background"
@@ -73,8 +73,10 @@ pointcloud:
   # 图像下采样因子（1.0表示不下采样）
   downsample_factor: 1.0
   # 深度范围过滤（米）
+  # 注意：不同数据集的深度范围可能不同
+  # dataset: 0-1米, dataset2: 3-7米
   min_depth: 0.0
-  max_depth: 1.0
+  max_depth: 10.0
   # 深度缩放因子（深度图存储单位转换为米）
   depth_scale: 1000.0
   # 最大时间差（毫秒），用于多视角图像匹配
