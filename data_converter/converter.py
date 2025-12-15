@@ -247,8 +247,13 @@ class Dataset2Converter:
         
         包含相机内参、外参等信息
         
-        重要：内参直接使用原始值，不进行任何缩放
-        同时添加 intrinsic_scale 字段标记是否需要在点云生成时缩放
+        重要：
+        - 内参直接使用原始值，不进行任何缩放
+        - 外参需要处理坐标系差异：
+          - 原始数据使用 OpenGL 坐标系（相机 Z 轴指向后方，Y 轴指向上方）
+          - Open3D 使用 OpenCV 坐标系（相机 Z 轴指向前方，Y 轴指向下方）
+          - 需要翻转 Y 和 Z 轴来转换
+        - 添加 intrinsic_scale 字段标记是否需要在点云生成时缩放
         """
         metadata = {
             "finish_time": int(self.camera_info.get("timestamp", 0) * 1000),
@@ -257,6 +262,16 @@ class Dataset2Converter:
         }
         
         cameras_list = self.camera_info.get("cameras", [])
+        
+        # OpenGL 到 OpenCV 坐标系转换矩阵（翻转 Y 和 Z 轴）
+        # OpenGL: X右, Y上, Z后
+        # OpenCV: X右, Y下, Z前
+        flip_yz = np.array([
+            [1,  0,  0, 0],
+            [0, -1,  0, 0],
+            [0,  0, -1, 0],
+            [0,  0,  0, 1]
+        ], dtype=np.float64)
         
         for idx, cam_name in enumerate(camera_names):
             if idx < len(cameras_list):
@@ -270,18 +285,22 @@ class Dataset2Converter:
                     [intrinsic_3x3[2][0], intrinsic_3x3[2][1], intrinsic_3x3[2][2], 0.0]
                 ]
                 
-                # 获取外参矩阵
-                extrinsic = cam_info.get("extrinsic_matrix", [
+                # 获取原始外参矩阵（world-to-camera，OpenGL 坐标系）
+                extrinsic_gl = np.array(cam_info.get("extrinsic_matrix", [
                     [1, 0, 0, 0],
                     [0, 1, 0, 0],
                     [0, 0, 1, 0],
                     [0, 0, 0, 1]
-                ])
+                ]), dtype=np.float64)
+                
+                # 转换为 OpenCV 坐标系：extrinsic_cv = flip_yz @ extrinsic_gl
+                # 这会将相机坐标系从 OpenGL 转换为 OpenCV
+                extrinsic_cv = flip_yz @ extrinsic_gl
                 
                 metadata["cameras"][cam_name] = {
                     "serial": str(cam_info.get("camera_id", idx)),
                     "intrinsic": intrinsic_3x4,
-                    "extrinsic": extrinsic,
+                    "extrinsic": extrinsic_cv.tolist(),  # world-to-camera (OpenCV 坐标系)
                     "is_dynamic": False,
                     "resolution": cam_info.get("resolution", [640, 480]),
                     "fx": cam_info.get("fx", intrinsic_3x3[0][0]),
